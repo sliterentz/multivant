@@ -7,14 +7,15 @@ $vm_memory = 2048    # Memori per VM dalam MB
 $vm_cpus = 2         # Jumlah CPU per VM
 
 # Konfigurasi Jaringan
-$blue_ip_prefix = "192.168.1.11"
-$green_ip_prefix = "192.168.1.12"
+$blue_ip_prefix = "192.168.50."
+$green_ip_prefix = "192.168.51."
 $host_port_prefix_blue = "81"
 $host_port_prefix_green = "82"
+$k3s_token = "my-super-secret-k3s-token" # Token untuk join worker node
 
 Vagrant.configure("2") do |config|
-  # Gunakan box Ubuntu 24.04 LTS (Noble Numbat)
-  config.vm.box = "ubuntu/noble64"
+  # Gunakan box Ubuntu 22.04 LTS (Jammy Jellyfish)
+  config.vm.box = "ubuntu/jammy64"
   
   # Sinkronisasi folder script ke semua node
   config.vm.synced_folder "./scripts", "/vagrant_scripts", disabled: false
@@ -26,98 +27,120 @@ Vagrant.configure("2") do |config|
   end
 
   # Fungsi untuk provisioning K3s master
-  def provision_k3s_master(node, ip)
+  def provision_k3s_master(node, ip, cluster_name)
     node.vm.provision "shell", inline: <<-SHELL
       echo "Disabling swap..."
       sudo swapoff -a
       sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
       echo "Installing K3s master..."
-      export INSTALL_K3S_EXEC="server --node-ip=#{ip} --flannel-iface=eth1"
-      curl -sfL https://get.k3s.io | sh -
+      export INSTALL_K3S_EXEC="server --node-ip=#{ip} --flannel-iface=enp0s8 --bind-address=#{ip} --advertise-address=#{ip} --tls-san #{ip}"
+      curl -sfL https://get.k3s.io | K3S_TOKEN="#{$k3s_token}" sh -
       
       echo "Waiting for K3s to be ready..."
       sleep 15
 
-      echo "Copying kubeconfig to shared location..."
-      sudo mkdir -p /vagrant/shared
-      sudo cp /etc/rancher/k3s/k3s.yaml /vagrant/shared/kubeconfig
-      sudo chmod 644 /vagrant/shared/kubeconfig
+      echo "Copying kubeconfig to shared location for #{cluster_name}..."
+      sudo mkdir -p /vagrant/shared/#{cluster_name}
+      sudo cp /etc/rancher/k3s/k3s.yaml /vagrant/shared/#{cluster_name}/kubeconfig
+      sudo chmod 644 /vagrant/shared/#{cluster_name}/kubeconfig
       
-      echo "K3s master installation complete. Kubeconfig is at ./shared/kubeconfig"
-      echo "Run 'export KUBECONFIG=$(pwd)/shared/kubeconfig' to use kubectl from your host."
+      echo "K3s master for #{cluster_name} installation complete. Kubeconfig is at ./shared/#{cluster_name}/kubeconfig"
+      echo "Run 'export KUBECONFIG=$(pwd)/shared/#{cluster_name}/kubeconfig' to use kubectl from your host."
     SHELL
   end
 
   # Fungsi untuk provisioning K3s worker
-  def provision_k3s_worker(node, master_ip)
+  def provision_k3s_worker(node, master_ip, worker_ip)
     node.vm.provision "shell", inline: <<-SHELL
       echo "Disabling swap..."
       sudo swapoff -a
       sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-      echo "Waiting for master to be ready..."
-      sleep 30
+      echo "Waiting for K3s API server on master to be ready..."
+      until sudo nc -zv #{master_ip} 6443; do
+        echo "K3s API server on master not yet available. Retrying in 5 seconds..."
+        sleep 5
+      done
+      echo "K3s API server is ready."
 
       echo "Installing K3s worker..."
-      export K3S_URL="https://#{master_ip}:6443"
-      export K3S_TOKEN=$(curl -s http://#{master_ip}:8080/token)
-      export INSTALL_K3S_EXEC="agent --node-ip=#{node.vm.network['private_network'][0][:ip]} --flannel-iface=eth1"
-      curl -sfL https://get.k3s.io | sh -
+      curl -sfL https://get.k3s.io | \
+        K3S_URL="https://#{master_ip}:6443" \
+        K3S_TOKEN="#{$k3s_token}" \
+        INSTALL_K3S_EXEC="agent --node-ip=#{worker_ip} --flannel-iface=enp0s8" \
+        INSTALL_K3S_SKIP_TLS_VERIFY=true \
+        sh -
     SHELL
   end
 
   # --- BLUE CLUSTER ---
   # Master Node Blue
   config.vm.define "blue-master" do |master|
-    master_ip = "#{$blue_ip_prefix}0"
+    master_ip = "#{$blue_ip_prefix}10"
     master.vm.hostname = "blue-master"
     master.vm.network "private_network", ip: master_ip
     master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_blue}80", auto_correct: true
     master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_blue}43", auto_correct: true
     
+    provision_k3s_master(master, master_ip, "blue")
+
     # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "mkdir -p /var/www/html && echo $(sudo cat /var/lib/rancher/k3s/server/node-token) > /var/www/html/token", run: "always"
     master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
     master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-    
-    provision_k3s_master(master, master_ip)
+      master.vm.provision "shell", inline: <<-SHELL
+      echo "Waiting for node-token to be created..."
+      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
+        sleep 2
+      done
+      echo "Node token found. Copying to web server..."
+      sudo mkdir -p /var/www/html
+      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
+    SHELL
   end
 
   # Worker Nodes Blue
   (1..$num_worker_nodes).each do |i|
     config.vm.define "blue-node-#{i}" do |node|
-      worker_ip = "#{$blue_ip_prefix}#{i}"
+      worker_ip = "#{$blue_ip_prefix}#{10 + i}"
       node.vm.hostname = "blue-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$blue_ip_prefix}0")
+      provision_k3s_worker(node, "#{$blue_ip_prefix}10", worker_ip)
     end
   end
 
   # --- GREEN CLUSTER ---
   # Master Node Green
   config.vm.define "green-master" do |master|
-    master_ip = "#{$green_ip_prefix}0"
+    master_ip = "#{$green_ip_prefix}10"
     master.vm.hostname = "green-master"
     master.vm.network "private_network", ip: master_ip
     master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_green}80", auto_correct: true
     master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_green}43", auto_correct: true
-
+    
+    provision_k3s_master(master, master_ip, "green")
+    
     # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "mkdir -p /var/www/html && echo $(sudo cat /var/lib/rancher/k3s/server/node-token) > /var/www/html/token", run: "always"
     master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
     master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-
-    provision_k3s_master(master, master_ip)
+      master.vm.provision "shell", inline: <<-SHELL
+      echo "Waiting for node-token to be created..."
+      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
+        sleep 2
+      done
+      echo "Node token found. Copying to web server..."
+      sudo mkdir -p /var/www/html
+      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
+    SHELL
   end
 
   # Worker Nodes Green
   (1..$num_worker_nodes).each do |i|
     config.vm.define "green-node-#{i}" do |node|
-      worker_ip = "#{$green_ip_prefix}#{i}"
+      worker_ip = "#{$green_ip_prefix}#{10 + i}"
       node.vm.hostname = "green-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$green_ip_prefix}0")
+      provision_k3s_worker(node, "#{$green_ip_prefix}10", worker_ip)
     end
   end
 end
