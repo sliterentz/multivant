@@ -1,17 +1,28 @@
 # -*- Multicluster Blue Green Deployment With Vagrant -*-
 
+# Meload environment variables dari .env file menggunakan dotenv yang di install vagrant plugin
+unless Vagrant.has_plugin?("dotenv")
+  abort "The 'dotenv' vagrant plugin is not installed. Please run: vagrant plugin install dotenv"
+end
+require 'dotenv'
+Dotenv.load
+
 # Konfigurasi Cluster
 # Ubah nilai di bawah ini sesuai kebutuhan Anda
-$num_worker_nodes = 1 # Jumlah worker node per cluster (blue/green)
-$vm_memory = 2048    # Memori per VM dalam MB
-$vm_cpus = 2         # Jumlah CPU per VM
+$num_worker_nodes = ENV.fetch('NUM_WORKER_NODES', 1).to_i # Jumlah worker node per cluster (blue/green)
+$vm_memory = ENV.fetch('VM_MEMORY', 2048).to_i    # Memori per VM dalam MB
+$vm_cpus = ENV.fetch('VM_CPUS', 2).to_i         # Jumlah CPU per VM
 
 # Konfigurasi Jaringan
-$blue_ip_prefix = "192.168.50."
-$green_ip_prefix = "192.168.51."
-$host_port_prefix_blue = "81"
-$host_port_prefix_green = "82"
-$k3s_token = "my-super-secret-k3s-token" # Token untuk join worker node
+$blue_ip_prefix = ENV.fetch('BLUE_IP_PREFIX', "192.168.50.")
+$green_ip_prefix = ENV.fetch('GREEN_IP_PREFIX', "192.168.51.")
+$host_port_prefix_blue = ENV.fetch('HOST_PORT_PREFIX_BLUE', "81")
+$host_port_prefix_green = ENV.fetch('HOST_PORT_PREFIX_GREEN', "82")
+
+# Security
+$k3s_token = ENV.fetch('K3S_TOKEN') do
+  abort "K3S_TOKEN is not set in your .env file. Please define it."
+end # Token untuk join worker node
 
 Vagrant.configure("2") do |config|
   # Gunakan box Ubuntu 22.04 LTS (Jammy Jellyfish)
