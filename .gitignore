@@ -1,0 +1,11 @@
+# Ignore local environment file
+.env
+
+# Ignore Vagrant-specific files and directories
+.vagrant/
+
+# Ignore shared kubeconfig files
+shared/
+
+# Ignore Visual Studio Code configuration files and directories
+.vscode/
