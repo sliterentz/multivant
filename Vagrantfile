@@ -37,54 +37,6 @@ Vagrant.configure("2") do |config|
     vb.cpus = $vm_cpus
   end
 
-  # Fungsi untuk provisioning K3s master
-  def provision_k3s_master(node, ip, cluster_name)
-    node.vm.provision "shell", inline: <<-SHELL
-      echo "Disabling swap..."
-      sudo swapoff -a
-      sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
-
-      echo "Installing K3s master..."
-      export INSTALL_K3S_EXEC="server --node-ip=#{ip} --flannel-iface=enp0s8 --bind-address=#{ip} --advertise-address=#{ip} --tls-san #{ip}"
-      curl -sfL https://get.k3s.io | K3S_TOKEN="#{$k3s_token}" sh -
-      
-      echo "Waiting for K3s to be ready..."
-      sleep 15
-
-      echo "Copying kubeconfig to shared location for #{cluster_name}..."
-      sudo mkdir -p /vagrant/shared/#{cluster_name}
-      sudo cp /etc/rancher/k3s/k3s.yaml /vagrant/shared/#{cluster_name}/kubeconfig
-      sudo chmod 644 /vagrant/shared/#{cluster_name}/kubeconfig
-      
-      echo "K3s master for #{cluster_name} installation complete. Kubeconfig is at ./shared/#{cluster_name}/kubeconfig"
-      echo "Run 'export KUBECONFIG=$(pwd)/shared/#{cluster_name}/kubeconfig' to use kubectl from your host."
-    SHELL
-  end
-
-  # Fungsi untuk provisioning K3s worker
-  def provision_k3s_worker(node, master_ip, worker_ip)
-    node.vm.provision "shell", inline: <<-SHELL
-      echo "Disabling swap..."
-      sudo swapoff -a
-      sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
-
-      echo "Waiting for K3s API server on master to be ready..."
-      until sudo nc -zv #{master_ip} 6443; do
-        echo "K3s API server on master not yet available. Retrying in 5 seconds..."
-        sleep 5
-      done
-      echo "K3s API server is ready."
-
-      echo "Installing K3s worker..."
-      curl -sfL https://get.k3s.io | \
-        K3S_URL="https://#{master_ip}:6443" \
-        K3S_TOKEN="#{$k3s_token}" \
-        INSTALL_K3S_EXEC="agent --node-ip=#{worker_ip} --flannel-iface=enp0s8" \
-        INSTALL_K3S_SKIP_TLS_VERIFY=true \
-        sh -
-    SHELL
-  end
-
   # --- BLUE CLUSTER ---
   # Master Node Blue
   config.vm.define "blue-master" do |master|
@@ -93,21 +45,18 @@ Vagrant.configure("2") do |config|
     master.vm.network "private_network", ip: master_ip
     master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_blue}80", auto_correct: true
     master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_blue}43", auto_correct: true
-    
-    provision_k3s_master(master, master_ip, "blue")
 
-    # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
-    master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-      master.vm.provision "shell", inline: <<-SHELL
-      echo "Waiting for node-token to be created..."
-      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
-        sleep 2
-      done
-      echo "Node token found. Copying to web server..."
-      sudo mkdir -p /var/www/html
-      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
-    SHELL
+    master.vm.provision "ansible" do |ansible|
+      ansible.playbook = "ansible/playbook.yml"
+      ansible.groups = {
+        "masters" => ["blue-master"],
+        "blue_cluster" => ["blue-master"]
+      }
+      ansible.extra_vars = {
+        k3s_token: $k3s_token,
+        cluster_name: "blue"
+      }
+    end
   end
 
   # Worker Nodes Blue
@@ -116,7 +65,18 @@ Vagrant.configure("2") do |config|
       worker_ip = "#{$blue_ip_prefix}#{10 + i}"
       node.vm.hostname = "blue-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$blue_ip_prefix}10", worker_ip)
+
+      node.vm.provision "ansible" do |ansible|
+        ansible.playbook = "ansible/playbook.yml"
+        ansible.groups = {
+          "workers" => ["blue-node-#{i}"],
+          "blue_cluster" => ["blue-node-#{i}"]
+        }
+        ansible.extra_vars = {
+          k3s_token: $k3s_token,
+          master_ip: "#{$blue_ip_prefix}10"
+        }
+      end
     end
   end
 
@@ -129,20 +89,17 @@ Vagrant.configure("2") do |config|
     master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_green}80", auto_correct: true
     master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_green}43", auto_correct: true
     
-    provision_k3s_master(master, master_ip, "green")
-    
-    # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
-    master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-      master.vm.provision "shell", inline: <<-SHELL
-      echo "Waiting for node-token to be created..."
-      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
-        sleep 2
-      done
-      echo "Node token found. Copying to web server..."
-      sudo mkdir -p /var/www/html
-      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
-    SHELL
+    master.vm.provision "ansible" do |ansible|
+      ansible.playbook = "ansible/playbook.yml"
+      ansible.groups = {
+        "masters" => ["green-master"],
+        "green_cluster" => ["green-master"]
+      }
+      ansible.extra_vars = {
+        k3s_token: $k3s_token,
+        cluster_name: "green"
+      }
+    end    
   end
 
   # Worker Nodes Green
@@ -151,7 +108,18 @@ Vagrant.configure("2") do |config|
       worker_ip = "#{$green_ip_prefix}#{10 + i}"
       node.vm.hostname = "green-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$green_ip_prefix}10", worker_ip)
+
+      node.vm.provision "ansible" do |ansible|
+        ansible.playbook = "ansible/playbook.yml"
+        ansible.groups = {
+          "workers" => ["green-node-#{i}"],
+          "green_cluster" => ["green-node-#{i}"]
+        }
+        ansible.extra_vars = {
+          k3s_token: $k3s_token,
+          master_ip: "#{$green_ip_prefix}10"
+        }
+      end  
     end
   end
 end

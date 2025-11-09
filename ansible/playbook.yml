@@ -1,0 +1,31 @@
+---
+- name: Provision all nodes (Common Setup)
+  hosts: all
+  become: yes
+  roles:
+    - common
+
+- name: Provision K3s Master Nodes (Control Plane)
+  hosts: masters
+  become: yes
+  roles:
+    - role: k3s-master
+      tags: [control_plane]
+
+- name: Provision K3s Worker Nodes (Data Plane)
+  hosts: workers
+  become: yes
+  roles:
+    - role: k3s-worker
+      tags: [data_plane]
+
+- name: Provision Platform Tooling on Masters
+  hosts: masters
+  become: yes
+  roles:
+    - role: build-plane
+      tags: [build_plane]
+    - role: observability
+      tags: [observability_plane]
+    # - role: identity-plane
+    #   tags: [identity_plane]

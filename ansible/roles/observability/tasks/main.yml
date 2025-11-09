@@ -1,0 +1,24 @@
+---
+- name: Apply Kubernetes Metrics Server manifest
+  ansible.builtin.command: >
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  args:
+    chdir: "/home/vagrant"
+  environment:
+    KUBECONFIG: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+  register: metrics_server_result
+  changed_when: "'created' in metrics_server_result.stdout or 'configured' in metrics_server_result.stdout"
+  become: no
+  run_once: true
+  delegate_to: localhost
+
+- name: Wait for Metrics Server to be available
+  ansible.builtin.command: >
+    kubectl wait --for=condition=available deployment/metrics-server -n kube-system --timeout=300s
+  args:
+    chdir: "/home/vagrant"
+  environment:
+    KUBECONFIG: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+  become: no
+  run_once: true
+  delegate_to: localhost

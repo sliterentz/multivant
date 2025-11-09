@@ -1,0 +1,50 @@
+---
+- name: Install K3s master node
+  ansible.builtin.shell: >
+    curl -sfL https://get.k3s.io |
+    INSTALL_K3S_EXEC="server
+      --node-ip={{ ansible_default_ipv4.address }}
+      --flannel-iface=enp0s8
+      --bind-address={{ ansible_default_ipv4.address }}
+      --advertise-address={{ ansible_default_ipv4.address }}
+      --tls-san {{ ansible_default_ipv4.address }}"
+    sh -
+  args:
+    creates: /usr/local/bin/k3s
+  changed_when: true
+
+- name: Wait for K3s to be ready
+  ansible.builtin.wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    timeout: 15
+
+- name: Read the K3s node token from the master
+  ansible.builtin.command: cat /var/lib/rancher/k3s/server/node-token
+  register: k3s_token_raw
+  changed_when: false
+
+- name: Store K3s node token for worker nodes
+  ansible.builtin.set_fact:
+    k3s_token: "{{ k3s_token_raw.stdout }}"
+    cacheable: yes
+
+- name: Create shared directory for kubeconfig
+  ansible.builtin.file:
+    path: "/vagrant/shared/{{ cluster_name }}"
+    state: directory
+    mode: '0755'
+
+- name: Copy kubeconfig to shared location
+  ansible.builtin.copy:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+    remote_src: yes
+    owner: vagrant
+    group: vagrant
+    mode: '0644'
+
+- name: Replace localhost with master IP in kubeconfig
+  ansible.builtin.lineinfile:
+    path: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+    regexp: '    server: https://127.0.0.1:6443'
+    line: '    server: https://{{ ansible_default_ipv4.address }}:6443'
