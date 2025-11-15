@@ -1,24 +1,75 @@
 ---
-- name: Apply Kubernetes Metrics Server manifest
-  ansible.builtin.command: >
-    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-  args:
-    chdir: "/home/vagrant"
-  environment:
-    KUBECONFIG: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
-  register: metrics_server_result
-  changed_when: "'created' in metrics_server_result.stdout or 'configured' in metrics_server_result.stdout"
-  become: no
-  run_once: true
+- name: Install Kubernetes-related Python libraries on localhost
+  ansible.builtin.pip:
+    name:
+      - kubernetes
+      - pyyaml
+    state: present
   delegate_to: localhost
+  run_once: true
+  become: no
+
+- name: Download Metrics Server manifest
+  ansible.builtin.get_url:
+    url: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    dest: "/tmp/metrics-server-components.yaml"
+    mode: '0644'
+    force: true  # This is the critical fix to overwrite the corrupted file
+  delegate_to: localhost
+  run_once: true
+  become: no
+
+- name: Ensure kubeconfig points to the master IP
+  ansible.builtin.replace:
+    path: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
+    regexp: '127\.0\.0\.1'
+    replace: "{{ hostvars[groups['masters'][0]]['master_ip'] }}"
+  delegate_to: localhost
+  run_once: true
+  become: no
+
+- name: Load manifest content into a fact
+  ansible.builtin.set_fact:
+    # Load and parse all YAML documents from the manifest file
+    manifest_docs: "{{ lookup('file', '/tmp/metrics-server-components.yaml') | from_yaml_all }}"
+  delegate_to: localhost
+  run_once: true
+  become: no
+
+- name: Apply and patch Metrics Server manifest
+  ansible.builtin.k8s:
+    state: present
+    kubeconfig: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
+    resource_definition: "{{ item | combine(patch, recursive=True) if (item.kind == 'Deployment' and item.metadata.name == 'metrics-server') else item }}"
+  loop: "{{ manifest_docs }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+  vars:
+    extra_args:
+      - --kubelet-insecure-tls
+      - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: metrics-server
+                args: "{{ (item.spec.template.spec.containers[0].args | default([])) + extra_args }}"
+  delegate_to: localhost
+  run_once: true
+  become: no
 
 - name: Wait for Metrics Server to be available
-  ansible.builtin.command: >
-    kubectl wait --for=condition=available deployment/metrics-server -n kube-system --timeout=300s
-  args:
-    chdir: "/home/vagrant"
-  environment:
-    KUBECONFIG: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
-  become: no
-  run_once: true
+  ansible.builtin.k8s_info:
+    kind: Deployment
+    name: metrics-server
+    namespace: kube-system
+    kubeconfig: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
+    wait: yes
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
   delegate_to: localhost
+  run_once: true
+  become: no

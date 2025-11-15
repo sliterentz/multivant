@@ -6,14 +6,16 @@
     delay: 5
     timeout: 120
 
+- name: Set K3s worker node arguments
+  ansible.builtin.set_fact:
+    k3s_worker_exec_args: "agent --node-ip={{ worker_ip }} --flannel-iface=enp0s8"
+
 - name: Install K3s worker node
   ansible.builtin.shell: >
     curl -sfL https://get.k3s.io |
     K3S_URL="https://{{ master_ip }}:6443"
-    K3S_TOKEN="{{ hostvars[groups['masters'][0]]['k3s_token'] }}"
-    INSTALL_K3S_EXEC="agent
-      --node-ip={{ ansible_default_ipv4.address }}
-      --flannel-iface=enp0s8"
+    K3S_TOKEN="{{ k3s_token }}"
+    INSTALL_K3S_EXEC="{{ k3s_worker_exec_args }}"
     INSTALL_K3S_SKIP_TLS_VERIFY=true
     sh -
   args:

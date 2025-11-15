@@ -25,16 +25,36 @@ $k3s_token = ENV.fetch('K3S_TOKEN') do
 end # Token untuk join worker node
 
 Vagrant.configure("2") do |config|
+  config.vm.network :forwarded_port, guest: 22, host: 2522, auto_correct: true, id: "ssh"
   # Gunakan box Ubuntu 22.04 LTS (Jammy Jellyfish)
   config.vm.box = "ubuntu/jammy64"
   
   # Sinkronisasi folder script ke semua node
-  config.vm.synced_folder "./scripts", "/vagrant_scripts", disabled: false
+  config.vm.synced_folder "./scripts", "/vagrant_scripts", disabled: true
+
+  # Atasi masalah sinkronisasi folder saat menggunakan WSL
+  if ENV['WSL_DISTRO_NAME']
+    config.vm.synced_folder ".", "/vagrant", type: "rsync"
+    # config.vm.synced_folder "./scripts", "/vagrant_scripts", type: "rsync"
+  end
 
   # Pengaturan default untuk provider VirtualBox
   config.vm.provider "virtualbox" do |vb|
     vb.memory = $vm_memory
     vb.cpus = $vm_cpus
+    # Fix for VBoxManage error: "RawFile#0 failed to create the raw output file /dev/null"
+    vb.customize ["modifyvm", :id, "--uartmode1", "disconnected"]
+  end
+
+  # Pengaturan default untuk provider Hyper-V
+  config.vm.provider "hyperv" do |hv|
+    hv.memory = $vm_memory
+    hv.cpus = $vm_cpus
+    hv.vm_config_path = ".vagrant/hyperv_config"
+    hv.check_admin_acls = false
+    hv.linked_clone = true
+    hv.ip_address_timeout = 120
+    hv.network_switch_name = "WSL-HyperV-NAT"
   end
 
   # --- BLUE CLUSTER ---
@@ -54,7 +74,8 @@ Vagrant.configure("2") do |config|
       }
       ansible.extra_vars = {
         k3s_token: $k3s_token,
-        cluster_name: "blue"
+        cluster_name: "blue",
+        master_ip: "#{$blue_ip_prefix}10"
       }
     end
   end
@@ -65,6 +86,7 @@ Vagrant.configure("2") do |config|
       worker_ip = "#{$blue_ip_prefix}#{10 + i}"
       node.vm.hostname = "blue-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
+      # provision_k3s_worker(node, "#{$blue_ip_prefix}10", worker_ip)
 
       node.vm.provision "ansible" do |ansible|
         ansible.playbook = "ansible/playbook.yml"
@@ -74,7 +96,8 @@ Vagrant.configure("2") do |config|
         }
         ansible.extra_vars = {
           k3s_token: $k3s_token,
-          master_ip: "#{$blue_ip_prefix}10"
+          master_ip: "#{$blue_ip_prefix}10",
+          worker_ip: "#{$blue_ip_prefix}#{10 + i}"
         }
       end
     end
@@ -88,7 +111,6 @@ Vagrant.configure("2") do |config|
     master.vm.network "private_network", ip: master_ip
     master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_green}80", auto_correct: true
     master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_green}43", auto_correct: true
-    
     master.vm.provision "ansible" do |ansible|
       ansible.playbook = "ansible/playbook.yml"
       ansible.groups = {
@@ -97,7 +119,8 @@ Vagrant.configure("2") do |config|
       }
       ansible.extra_vars = {
         k3s_token: $k3s_token,
-        cluster_name: "green"
+        cluster_name: "green",
+        master_ip: "#{$green_ip_prefix}10"
       }
     end    
   end
@@ -108,6 +131,7 @@ Vagrant.configure("2") do |config|
       worker_ip = "#{$green_ip_prefix}#{10 + i}"
       node.vm.hostname = "green-node-#{i}"
       node.vm.network "private_network", ip: worker_ip
+      # provision_k3s_worker(node, "#{$green_ip_prefix}10", worker_ip)
 
       node.vm.provision "ansible" do |ansible|
         ansible.playbook = "ansible/playbook.yml"
@@ -117,7 +141,8 @@ Vagrant.configure("2") do |config|
         }
         ansible.extra_vars = {
           k3s_token: $k3s_token,
-          master_ip: "#{$green_ip_prefix}10"
+          master_ip: "#{$green_ip_prefix}10",
+          worker_ip: "#{$green_ip_prefix}#{10 + i}"
         }
       end  
     end

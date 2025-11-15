@@ -10,6 +10,8 @@
   become: yes
   roles:
     - role: k3s-master
+      vars:
+        cluster_name: "{{ 'blue' if inventory_hostname in groups['blue_workers'] else 'green' }}"
       tags: [control_plane]
 
 - name: Provision K3s Worker Nodes (Data Plane)
@@ -17,6 +19,9 @@
   become: yes
   roles:
     - role: k3s-worker
+      vars:
+        master_ip: "{{ hostvars[groups[cluster_name + '_masters'][0]]['ansible_host'] }}"
+        cluster_name: "{{ 'blue' if inventory_hostname in groups['blue_workers'] else 'green' }}"    
       tags: [data_plane]
 
 - name: Provision Platform Tooling on Masters

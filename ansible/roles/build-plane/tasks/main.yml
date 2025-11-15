@@ -1,7 +1,12 @@
 ---
+- name: Get latest stable Kubernetes version
+  ansible.builtin.shell: curl -L -s https://dl.k8s.io/release/stable.txt
+  register: k8s_stable_version
+  changed_when: false
+
 - name: Install kubectl
   ansible.builtin.get_url:
-    url: "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    url: "https://dl.k8s.io/release/{{ k8s_stable_version.stdout }}/bin/linux/amd64/kubectl"
     dest: /usr/local/bin/kubectl
     mode: '0755'
   become: yes
@@ -14,3 +19,4 @@
   args:
     creates: /usr/local/bin/helm
   become: yes
+  
