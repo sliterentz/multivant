@@ -1,0 +1,49 @@
+---
+# K3s Cluster Common Configuration
+
+# K3s Version
+k3s_version: v1.28.5+k3s1
+
+# K3s Installation Method
+k3s_install_method: binary
+
+# K3s Configuration
+k3s_server_config:
+  write-kubeconfig-mode: "0644"
+  tls-san:
+    - "{{ ansible_default_ipv4.address }}"
+  disable:
+    - traefik  # We'll install it separately with custom config
+  cluster-cidr: "10.42.0.0/16"
+  service-cidr: "10.43.0.0/16"
+
+# K3s Agent Configuration
+k3s_agent_config:
+  node-label:
+    - "node-type={{ node_type | default('worker') }}"
+    - "cluster={{ cluster_name | default('default') }}"
+
+# Network Configuration
+k3s_flannel_backend: vxlan
+k3s_flannel_iface: eth1
+
+# Container Runtime
+k3s_container_runtime: containerd
+
+# Kubectl Configuration
+kubectl_config_dir: /home/vagrant/.kube
+kubectl_config_owner: vagrant
+kubectl_config_group: vagrant
+
+# Timeout Settings
+k3s_install_timeout: 300
+k3s_service_timeout: 120
+k3s_node_ready_timeout: 180
+
+# WSL Specific Settings
+k3s_wsl_mode: "{{ is_wsl | default(false) }}"
+k3s_wsl_mirrored: "{{ is_wsl_mirrored | default(false) }}"
+
+# Retry Settings
+k3s_install_retries: 3
+k3s_install_delay: 10

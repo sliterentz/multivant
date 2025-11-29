@@ -14,62 +14,241 @@
     url: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
     dest: "/tmp/metrics-server-components.yaml"
     mode: '0644'
-    force: true  # This is the critical fix to overwrite the corrupted file
+    force: true
+    validate_certs: false
+    timeout: 60
   delegate_to: localhost
   run_once: true
   become: no
+  retries: 3
+  delay: 5
 
-- name: Ensure kubeconfig points to the master IP
-  ansible.builtin.replace:
-    path: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
-    regexp: '127\.0\.0\.1'
-    replace: "{{ hostvars[groups['masters'][0]]['master_ip'] }}"
-  delegate_to: localhost
-  run_once: true
-  become: no
-
-- name: Load manifest content into a fact
+- name: Check if running in WSL
   ansible.builtin.set_fact:
-    # Load and parse all YAML documents from the manifest file
-    manifest_docs: "{{ lookup('file', '/tmp/metrics-server-components.yaml') | from_yaml_all }}"
+    is_wsl: "{{ lookup('env', 'WSL_DISTRO_NAME') != '' }}"
   delegate_to: localhost
-  run_once: true
   become: no
 
-- name: Apply and patch Metrics Server manifest
-  ansible.builtin.k8s:
-    state: present
-    kubeconfig: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
-    resource_definition: "{{ item | combine(patch, recursive=True) if (item.kind == 'Deployment' and item.metadata.name == 'metrics-server') else item }}"
-  loop: "{{ manifest_docs }}"
-  loop_control:
-    label: "{{ item.kind }}/{{ item.metadata.name }}"
-  vars:
-    extra_args:
-      - --kubelet-insecure-tls
-      - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
-    patch:
-      spec:
-        template:
-          spec:
-            containers:
-              - name: metrics-server
-                args: "{{ (item.spec.template.spec.containers[0].args | default([])) + extra_args }}"
+- name: Display environment info
+  ansible.builtin.debug:
+    msg: 
+      - "Running in WSL: {{ is_wsl }}"
+      - "Master IP: {{ master_ip }}"
+      - "Cluster: {{ cluster_name }}"
   delegate_to: localhost
-  run_once: true
   become: no
 
-- name: Wait for Metrics Server to be available
-  ansible.builtin.k8s_info:
-    kind: Deployment
-    name: metrics-server
-    namespace: kube-system
-    kubeconfig: "{{ playbook_dir }}/shared/{{ cluster_name }}/kubeconfig"
-    wait: yes
-    wait_condition:
-      type: Available
-      status: "True"
-    wait_timeout: 300
+- name: Test basic connectivity to master node
+  ansible.builtin.command:
+    cmd: ping -c 3 -W 2 {{ master_ip }}
   delegate_to: localhost
-  run_once: true
+  become: no
+  register: ping_result
+  failed_when: false
+  changed_when: false
+
+- name: Display ping result
+  ansible.builtin.debug:
+    msg: "{{ 'Ping successful' if ping_result.rc == 0 else 'Ping failed - network issue detected' }}"
+  delegate_to: localhost
+  become: no
+
+- name: Test port 6443 connectivity
+  ansible.builtin.wait_for:
+    host: "{{ master_ip }}"
+    port: 6443
+    timeout: 30
+    state: started
+  delegate_to: localhost
+  become: no
+  register: port_check
+  failed_when: false
+
+- name: Fail if port is not reachable
+  ansible.builtin.fail:
+    msg: |
+      ❌ Cannot reach K3s API server at {{ master_ip }}:6443
+      
+      Troubleshooting steps:
+      1. Check if VM is running: vagrant status
+      2. Check K3s service: vagrant ssh {{ cluster_name }}-master -c 'sudo systemctl status k3s'
+      3. Check firewall: vagrant ssh {{ cluster_name }}-master -c 'sudo ufw status'
+      4. Try from inside VM: vagrant ssh {{ cluster_name }}-master -c 'kubectl get nodes'
+  when: port_check.failed | default(false)
+  delegate_to: localhost
+  become: no
+
+- name: Copy Metrics Server manifest to master node
+  ansible.builtin.copy:
+    src: "/tmp/metrics-server-components.yaml"
+    dest: "/tmp/metrics-server-components.yaml"
+    mode: '0644'
+  become: no
+
+- name: Verify K3s kubeconfig exists on master
+  ansible.builtin.stat:
+    path: /etc/rancher/k3s/k3s.yaml
+  become: yes
+  register: k3s_kubeconfig
+
+- name: Fail if K3s kubeconfig not found
+  ansible.builtin.fail:
+    msg: "K3s kubeconfig not found at /etc/rancher/k3s/k3s.yaml"
+  when: not k3s_kubeconfig.stat.exists
+
+- name: Display kubeconfig status
+  ansible.builtin.debug:
+    msg: "✅ K3s kubeconfig found at /etc/rancher/k3s/k3s.yaml"
+
+# Use K3s native kubeconfig instead of copied one
+- name: Apply Metrics Server manifest using K3s native kubeconfig
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl apply -f /tmp/metrics-server-components.yaml
+  become: yes
+  register: kubectl_apply
+  changed_when: "'configured' in kubectl_apply.stdout or 'created' in kubectl_apply.stdout"
+  retries: 3
+  delay: 10
+  until: kubectl_apply.rc == 0
+
+- name: Display kubectl apply output
+  ansible.builtin.debug:
+    var: kubectl_apply.stdout_lines
+  become: no
+
+- name: Wait for Metrics Server deployment to exist
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl -n kube-system get deployment metrics-server
+  become: yes
+  register: deployment_check
+  retries: 10
+  delay: 10
+  until: deployment_check.rc == 0
+  changed_when: false
+
+- name: Get current Metrics Server deployment args
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl -n kube-system get deployment metrics-server -o jsonpath='{.spec.template.spec.containers[0].args}'
+  become: yes
+  register: current_args
+  changed_when: false
+
+- name: Display current Metrics Server args
+  ansible.builtin.debug:
+    var: current_args.stdout
+  become: no
+
+- name: Check if kubelet-insecure-tls arg already exists
+  ansible.builtin.set_fact:
+    needs_patch: "{{ '--kubelet-insecure-tls' not in current_args.stdout }}"
+  become: no
+
+- name: Patch Metrics Server deployment with insecure TLS args
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl -n kube-system patch deployment metrics-server --type='json' -p='[
+      {
+        "op": "add",
+        "path": "/spec/template/spec/containers/0/args/-",
+        "value": "--kubelet-insecure-tls"
+      },
+      {
+        "op": "add",
+        "path": "/spec/template/spec/containers/0/args/-",
+        "value": "--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname"
+      },
+      {
+        "op": "add",
+        "path": "/spec/template/spec/containers/0/args/-",
+        "value": "--metric-resolution=30s"
+      }
+    ]'
+  become: yes
+  register: patch_result
+  changed_when: "'patched' in patch_result.stdout"
+  failed_when: false
+  when: needs_patch | bool
+
+- name: Display patch result
+  ansible.builtin.debug:
+    var: patch_result
+  when: needs_patch | bool
+  become: no
+
+- name: Wait for Metrics Server deployment to be ready
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl -n kube-system rollout status deployment/metrics-server --timeout=300s
+  become: yes
+  register: rollout_status
+  changed_when: false
+  retries: 5
+  delay: 15
+  until: rollout_status.rc == 0
+
+- name: Wait additional time for Metrics Server to stabilize
+  ansible.builtin.pause:
+    seconds: 30
+  become: no
+
+- name: Verify Metrics Server is responding
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl top nodes
+  become: yes
+  register: metrics_test
+  retries: 15
+  delay: 20
+  until: metrics_test.rc == 0
+  changed_when: false
+
+- name: Display Metrics Server verification result
+  ansible.builtin.debug:
+    msg: "✅ Metrics Server is ready and responding"
+  when: metrics_test.rc == 0
+  become: no
+
+- name: Display node metrics
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl top nodes
+  become: yes
+  register: node_metrics
+  changed_when: false
+
+- name: Show node metrics output
+  ansible.builtin.debug:
+    var: node_metrics.stdout_lines
+  become: no
+
+- name: Display pod metrics
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl top pods -A
+  become: yes
+  register: pod_metrics
+  changed_when: false
+  failed_when: false
+
+- name: Show pod metrics output
+  ansible.builtin.debug:
+    var: pod_metrics.stdout_lines
+  when: pod_metrics.rc == 0
+  become: no
+
+- name: Cleanup temporary manifest file
+  ansible.builtin.file:
+    path: "/tmp/metrics-server-components.yaml"
+    state: absent
+  become: no
+
+- name: Display completion message
+  ansible.builtin.debug:
+    msg:
+      - "✅ Observability setup completed for {{ cluster_name }} cluster"
+      - "Metrics Server is installed and running"
+      - "You can check metrics with: kubectl top nodes"
   become: no

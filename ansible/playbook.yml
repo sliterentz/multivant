@@ -1,36 +1,66 @@
 ---
-- name: Provision all nodes (Common Setup)
+- name: Configure All Nodes
   hosts: all
   become: yes
-  roles:
-    - common
+  gather_facts: yes
+  tasks:
+    - name: Set timezone
+      timezone:
+        name: UTC
 
-- name: Provision K3s Master Nodes (Control Plane)
-  hosts: masters
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+- name: Configure K3s Cluster Nodes
+  hosts: k3s_cluster
   become: yes
+  gather_facts: yes
+  roles:
+    - role: common
+      tags: ['common']
+
+- name: Configure K3s Master Nodes
+  hosts: k3s_master
+  become: yes
+  gather_facts: yes
+  serial: 1
   roles:
     - role: k3s-master
-      vars:
-        cluster_name: "{{ 'blue' if inventory_hostname in groups['blue_workers'] else 'green' }}"
-      tags: [control_plane]
+      tags: ['k3s', 'k3s-master', 'master']
 
-- name: Provision K3s Worker Nodes (Data Plane)
-  hosts: workers
+- name: Configure K3s Worker Nodes
+  hosts: k3s_worker
   become: yes
+  gather_facts: yes
   roles:
     - role: k3s-worker
-      vars:
-        master_ip: "{{ hostvars[groups[cluster_name + '_masters'][0]]['ansible_host'] }}"
-        cluster_name: "{{ 'blue' if inventory_hostname in groups['blue_workers'] else 'green' }}"    
-      tags: [data_plane]
+      tags: ['k3s', 'k3s-worker', 'worker']
 
-- name: Provision Platform Tooling on Masters
-  hosts: masters
+- name: Configure Identity Plane
+  hosts: identity_plane
   become: yes
+  gather_facts: yes
+  roles:
+    - role: identity-plane
+      tags: ['identity', 'identity-plane']
+  when: enable_identity_plane | default(false) | bool
+
+- name: Configure Build Plane
+  hosts: build_plane
+  become: yes
+  gather_facts: yes
   roles:
     - role: build-plane
-      tags: [build_plane]
+      tags: ['build', 'build-plane']
+  when: enable_build_plane | default(false) | bool
+
+- name: Configure Observability Plane
+  hosts: observability_plane
+  become: yes
+  gather_facts: yes
+  roles:
     - role: observability
-      tags: [observability_plane]
-    # - role: identity-plane
-    #   tags: [identity_plane]
+      tags: ['observability', 'monitoring']
+  when: enable_observability | default(false) | bool

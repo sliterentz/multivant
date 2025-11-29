@@ -1,23 +1,207 @@
 ---
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - master_ip is defined
+      - master_ip != ""
+      - worker_ip is defined
+      - worker_ip != ""
+      - k3s_token is defined
+      - k3s_token != ""
+    fail_msg: "Required variables (master_ip, worker_ip, k3s_token) must be defined"
+    success_msg: "All required variables are defined"
+
+- name: Display worker node configuration
+  ansible.builtin.debug:
+    msg:
+      - "Cluster: {{ cluster_name }}"
+      - "Worker IP: {{ worker_ip }}"
+      - "Master IP: {{ master_ip }}"
+      - "K3s Token: {{ k3s_token[:10] }}..." # Show only first 10 chars for security
+
+- name: Set master node name based on cluster
+  ansible.builtin.set_fact:
+    master_node_name: "{{ cluster_name }}-master"
+
+- name: Display master node name
+  ansible.builtin.debug:
+    msg: "Will delegate checks to master node: {{ master_node_name }}"
+
+- name: Test network connectivity to master
+  ansible.builtin.command: ping -c 3 {{ master_ip }}
+  register: ping_result
+  changed_when: false
+  failed_when: false
+
+- name: Display ping result
+  ansible.builtin.debug:
+    msg: "{{ 'Network connectivity OK' if ping_result.rc == 0 else 'WARNING: Cannot ping master node' }}"
+
 - name: Wait for K3s API server on master to be ready
   ansible.builtin.wait_for:
     host: "{{ master_ip }}"
     port: 6443
-    delay: 5
-    timeout: 120
+    delay: 15
+    timeout: 300
+    state: started
+    sleep: 5
+  register: api_wait
+  retries: 5
+  delay: 30
+  until: api_wait is succeeded
 
+- name: Display API server status
+  ansible.builtin.debug:
+    msg: "✅ K3s API server is reachable at {{ master_ip }}:6443"
+
+- name: Verify master K3s service is running (delegate to master)
+  ansible.builtin.command: systemctl is-active k3s
+  delegate_to: "{{ groups[cluster_name + '_master'][0] }}"
+  register: master_k3s_status
+  changed_when: false
+  failed_when: false
+
+- name: Display master K3s service status
+  ansible.builtin.debug:
+    msg: "Master K3s service status: {{ master_k3s_status.stdout }}"
+
+- name: Fail if master K3s is not active
+  ansible.builtin.fail:
+    msg: |
+      ❌ Master K3s service is not active!
+      Status: {{ master_k3s_status.stdout }}
+      
+      Please check master node:
+      vagrant ssh {{ cluster_name }}-master -c 'sudo systemctl status k3s'
+  when: master_k3s_status.stdout != "active"
+
+- name: Test API server connectivity with curl
+  ansible.builtin.command: >
+    curl -k -s -o /dev/null -w "%{http_code}" 
+    https://{{ master_ip }}:6443/healthz
+  register: api_health
+  changed_when: false
+  failed_when: false
+
+- name: Display API health check result
+  ansible.builtin.debug:
+    msg: "API server health check returned: {{ api_health.stdout }}"
+      
 - name: Set K3s worker node arguments
   ansible.builtin.set_fact:
-    k3s_worker_exec_args: "agent --node-ip={{ worker_ip }} --flannel-iface=enp0s8"
+    k3s_worker_exec_args: >-
+      agent
+      --node-ip={{ worker_ip }}
+      --flannel-iface=enp0s8
+      --server https://{{ master_ip }}:6443
+      --token {{ k3s_token }}
+
+- name: Display K3s worker arguments
+  ansible.builtin.debug:
+    msg: "K3s worker will join with: {{ k3s_worker_exec_args | regex_replace(k3s_token, 'REDACTED') }}"
+
+- name: Check if K3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Display K3s installation status
+  ansible.builtin.debug:
+    msg: "{{ 'K3s already installed, will skip installation' if k3s_binary.stat.exists else 'K3s not installed, proceeding with installation' }}"
+
+- name: Download K3s installer script
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s-installer.sh
+    mode: '0755'
+    timeout: 60
+  retries: 3
+  delay: 5
+  when: not k3s_binary.stat.exists
 
 - name: Install K3s worker node
-  ansible.builtin.shell: >
-    curl -sfL https://get.k3s.io |
-    K3S_URL="https://{{ master_ip }}:6443"
-    K3S_TOKEN="{{ k3s_token }}"
-    INSTALL_K3S_EXEC="{{ k3s_worker_exec_args }}"
-    INSTALL_K3S_SKIP_TLS_VERIFY=true
-    sh -
+  ansible.builtin.command: sh /tmp/k3s-installer.sh
+  environment:
+    INSTALL_K3S_EXEC: "{{ k3s_worker_exec_args }}"
+    INSTALL_K3S_SKIP_TLS_VERIFY: "true"
+    K3S_URL: "https://{{ master_ip }}:6443"
+    K3S_TOKEN: "{{ k3s_token }}"
   args:
     creates: /usr/local/bin/k3s
-  changed_when: true
+  register: k3s_install_result
+  changed_when: k3s_install_result.rc == 0
+  when: not k3s_binary.stat.exists
+
+- name: Display K3s installation output
+  ansible.builtin.debug:
+    var: k3s_install_result.stdout_lines
+  when: 
+    - k3s_install_result is defined
+    - k3s_install_result.stdout is defined
+    - k3s_install_result.stdout != ""
+
+- name: Wait for K3s agent service to be active
+  ansible.builtin.systemd:
+    name: k3s-agent
+    state: started
+    enabled: yes
+  register: k3s_service
+  retries: 5
+  delay: 10
+  until: k3s_service is succeeded
+
+- name: Verify K3s agent is running
+  ansible.builtin.systemd:
+    name: k3s-agent
+  register: k3s_agent_status
+
+- name: Display K3s agent status
+  ansible.builtin.debug:
+    msg: "✅ K3s agent is {{ k3s_agent_status.status.ActiveState }}"
+
+- name: Wait for node to be registered with master
+  ansible.builtin.pause:
+    seconds: 20
+    prompt: "Waiting for node registration with master..."
+    
+- name: Verify node is registered (delegate to master)
+  ansible.builtin.command: kubectl get node {{ ansible_hostname }} -o name
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ master_node_name }}"
+  register: node_check
+  retries: 10
+  delay: 10
+  until: node_check.rc == 0
+  changed_when: false
+  failed_when: false
+  
+- name: Display node registration status
+  ansible.builtin.debug:
+    msg: "{{ '✅ Node successfully registered with master' if node_check.rc == 0 else '⚠️  Node registration pending' }}"
+
+- name: Get node status from master
+  ansible.builtin.command: kubectl get node {{ ansible_hostname }} -o wide
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ master_node_name }}"
+  register: node_status
+  changed_when: false
+  failed_when: false
+  when: node_check.rc == 0
+
+- name: Display node status
+  ansible.builtin.debug:
+    var: node_status.stdout_lines
+  when: 
+    - node_check.rc == 0
+    - node_status.stdout is defined
+
+- name: Display completion message
+  ansible.builtin.debug:
+    msg: 
+      - "✅ K3s worker node setup completed"
+      - "Node IP: {{ worker_ip }}"
+      - "Master: {{ master_ip }}"
+      - "Cluster: {{ cluster_name }}"
+      - "Master Node: {{ master_node_name }}"

@@ -1,0 +1,28 @@
+---
+# K3s Worker Node Configuration
+
+k3s_role: worker
+
+# K3s Agent Specific Configuration
+k3s_agent_extra_args:
+  - "--node-ip={{ ansible_default_ipv4.address }}"
+  - "--node-external-ip={{ ansible_default_ipv4.address }}"
+  - "--flannel-iface={{ k3s_flannel_iface }}"
+
+# Worker Node Labels
+k3s_worker_labels:
+  - "node-role.kubernetes.io/worker=true"
+  - "cluster={{ cluster_name }}"
+  - "environment={{ cluster_type | default('production') }}"
+  - "workload=general"
+
+# Resource Limits (Optional)
+k3s_kubelet_args:
+  - "--max-pods=110"
+  - "--kube-reserved=cpu=200m,memory=512Mi"
+  - "--system-reserved=cpu=200m,memory=512Mi"
+
+# Container Runtime Configuration
+k3s_containerd_config:
+  max_container_log_line_size: 16384
+  max_concurrent_downloads: 10

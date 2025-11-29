@@ -1,0 +1,39 @@
+---
+# K3s Master Node Configuration
+
+k3s_role: master
+
+# K3s Server Specific Configuration
+k3s_server_extra_args:
+  - "--disable-cloud-controller"
+  - "--disable-network-policy"
+  - "--flannel-backend={{ k3s_flannel_backend }}"
+  - "--flannel-iface={{ k3s_flannel_iface }}"
+  - "--bind-address={{ ansible_default_ipv4.address }}"
+  - "--advertise-address={{ ansible_default_ipv4.address }}"
+  - "--node-ip={{ ansible_default_ipv4.address }}"
+  - "--node-external-ip={{ ansible_default_ipv4.address }}"
+
+# Kubeconfig Settings
+k3s_kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+k3s_kubeconfig_mode: "0644"
+
+# Master Node Labels
+k3s_master_labels:
+  - "node-role.kubernetes.io/master=true"
+  - "node-role.kubernetes.io/control-plane=true"
+  - "cluster={{ cluster_name }}"
+  - "environment={{ cluster_type | default('production') }}"
+
+# Master Node Taints (Optional - uncomment to prevent workloads on master)
+# k3s_master_taints:
+#   - "node-role.kubernetes.io/master:NoSchedule"
+
+# High Availability Settings
+k3s_ha_enabled: false
+k3s_datastore_endpoint: ""
+
+# Backup Configuration
+k3s_backup_enabled: true
+k3s_backup_schedule: "0 2 * * *"  # Daily at 2 AM
+k3s_backup_retention_days: 7
