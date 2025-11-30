@@ -18,7 +18,7 @@ module VagrantProvisioners
         echo "127.0.0.1 localhost" | tee -a /etc/hosts
         
         # Disable swap
-        swapoff -a
+        swapoff -a || true
         sed -i '/swap/d' /etc/fstab
         
         # Load kernel modules
@@ -27,8 +27,8 @@ overlay
 br_netfilter
 EOF
         
-        modprobe overlay
-        modprobe br_netfilter
+        modprobe overlay 2>/dev/null || true
+        modprobe br_netfilter 2>/dev/null || true
         
         # Sysctl params
         cat <<EOF | tee /etc/sysctl.d/k8s.conf
@@ -37,7 +37,13 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
         
-        sysctl --system
+        # Apply sysctl settings, ignore errors for unsupported parameters
+        sysctl --system 2>&1 | grep -v "Invalid argument" || true
+
+        # Verify critical settings were applied
+        echo "Verifying critical sysctl settings..."
+        sysctl net.bridge.bridge-nf-call-iptables 2>/dev/null || echo "⚠️  bridge-nf-call-iptables not available"
+        sysctl net.ipv4.ip_forward 2>/dev/null || echo "⚠️  ip_forward not available"
         
         # Update system
         export DEBIAN_FRONTEND=noninteractive

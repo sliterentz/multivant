@@ -1,4 +1,9 @@
 module VagrantHelpers
+  # Detect if running in WSL
+  def self.running_in_wsl?
+    File.exist?('/proc/version') && File.read('/proc/version').include?('microsoft')
+  end
+
   class << self
     # WSL Detection
     def is_wsl?
@@ -68,7 +73,7 @@ module VagrantHelpers
       node.ssh.keep_alive = true
       
       # Connection timeouts
-      node.ssh.connect_timeout = 300  # 5 minutes
+      node.ssh.connect_timeout = 720  # 12 minutes
       node.ssh.guest_port = 22
 
       # SSH extra arguments - disable problematic features
@@ -79,7 +84,7 @@ module VagrantHelpers
         "-o", "IdentitiesOnly=yes",
         "-o", "ServerAliveInterval=60",
         "-o", "ServerAliveCountMax=5",
-        "-o", "ConnectTimeout=300"
+        "-o", "ConnectTimeout=720"
       ]
      # For WSL environments
       if VagrantConfig.is_wsl_mirrored?
@@ -222,10 +227,24 @@ module VagrantHelpers
         
         # Check if private network is configured
         echo -e "\nTesting private network..."
-        if ip addr show eth1 | grep -q "#{ip_address}"; then
+        
+        # Find the interface with the private IP (could be eth1, enp0s8, etc.)
+        PRIVATE_IFACE=$(ip addr show | grep -B 2 "#{ip_address}" | head -n 1 | awk '{print $2}' | tr -d ':')
+        
+        if [ -n "$PRIVATE_IFACE" ]; then
+          echo "✅ Private network interface: $PRIVATE_IFACE"
           echo "✅ Private network (#{ip_address}): OK"
         else
-          echo "⚠️  Private network (#{ip_address}): FAILED"
+          # Check if eth1 exists at all
+          if ip link show eth1 >/dev/null 2>&1; then
+            echo "⚠️  eth1 exists but IP #{ip_address} not found"
+            echo "Current eth1 configuration:"
+            ip addr show eth1
+          else
+            echo "⚠️  Private network interface not found"
+            echo "Available interfaces:"
+            ip link show
+          fi
         fi
         
         # Check SSH service
@@ -456,6 +475,30 @@ EOF
       
       # 9. Post-installation verification
       VagrantProvisioners.verify_k3s_installation(node, "worker")
+    end
+
+    # Wait for network interface to be ready
+    def wait_for_network_interface(node, ip_address)
+      node.vm.provision "shell", inline: <<-SHELL, privileged: false, run: "once"
+        echo "Waiting for network interface with IP #{ip_address} to be ready..."
+        timeout=60
+        while [ $timeout -gt 0 ]; do
+          # Find the interface with the specific IP
+          if ip addr show | grep -q "inet #{ip_address}"; then
+            IFACE=$(ip addr show | grep -B 2 "inet #{ip_address}" | head -n 1 | awk '{print $2}' | tr -d ':')
+            echo "✅ Network interface $IFACE is ready with IP #{ip_address}"
+            break
+          fi
+          sleep 2
+          timeout=$((timeout - 2))
+        done
+        
+        if [ $timeout -le 0 ]; then
+          echo "⚠️  Warning: Network interface with IP #{ip_address} not ready after 60 seconds"
+          echo "Available interfaces:"
+          ip addr show
+        fi
+      SHELL
     end
   end
 end

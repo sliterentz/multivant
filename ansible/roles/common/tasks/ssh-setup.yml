@@ -7,12 +7,6 @@
     owner: root
     group: root
 
-- name: restart ssh
-  systemd:
-    name: ssh
-    state: restarted
-  listen: restart ssh
-
 - name: Configure SSH daemon for better connectivity
   lineinfile:
     path: /etc/ssh/sshd_config

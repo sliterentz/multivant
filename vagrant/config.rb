@@ -25,6 +25,7 @@ module VagrantConfig
 
     # Base VM Configuration
     def configure_base(config)
+      config.vm.network :forwarded_port, guest: 22, host: 2522, auto_correct: true, id: "ssh"
       config.vm.box = "ubuntu/jammy64"
       config.vm.box_check_update = true
 
@@ -37,9 +38,10 @@ module VagrantConfig
       
       # Add boot timeout
       config.vm.boot_timeout = 600  # 10 minutes for boot
-
+      config.vm.graceful_halt_timeout = 60
+      
       # Disable default SSH port forwarding to avoid conflicts
-      config.vm.network :forwarded_port, guest: 22, host: 2222, id: "ssh", disabled: true
+      # config.vm.network :forwarded_port, guest: 22, host: 2222, id: "ssh", disabled: true
 
       # Synced Folders Configuration
       configure_synced_folders(config)
@@ -176,37 +178,163 @@ EOF
       end
     end
     
-    # WSL Detection
-    def is_wsl?
-      ENV['WSL_DISTRO_NAME'] != nil
+    # Check if WSL is using mirrored networking mode
+    def is_wsl_mirrored?
+      return false unless is_wsl?
+      
+      # Check WSL configuration
+      wsl_config = '/mnt/c/Users/' + ENV['USER'] + '/.wslconfig'
+      
+      if File.exist?(wsl_config)
+        config_content = File.read(wsl_config)
+        return config_content.include?('networkingMode=mirrored')
+      end
+      
+      # Default to false if config doesn't exist
+      false
+    rescue
+      false
     end
 
-    def is_wsl_mirrored?
-      if is_wsl?
-        # Try Windows user profile path first
-        windows_home = `cmd.exe /c "echo %USERPROFILE%" 2>/dev/null`.strip.gsub('\\', '/')
-        
-        # Convert Windows path to WSL path if needed
-        if windows_home && !windows_home.empty?
-          wsl_path = `/usr/bin/wslpath "#{windows_home}" 2>/dev/null`.strip
-          wslconfig_path = File.join(wsl_path, '.wslconfig') if wsl_path && !wsl_path.empty?
-        end
-        
-        # Fallback to direct path
-        wslconfig_path ||= '/mnt/c/Users/' + ENV['USER'] + '/.wslconfig'
-        
-        if File.exist?(wslconfig_path)
-          content = File.read(wslconfig_path)
-          # Check for mirrored mode in [wsl2] section
-          return content.match?(/\[wsl2\].*networkingMode\s*=\s*mirrored/m) ||
-                 content.match?(/networkingMode\s*=\s*mirrored/)
+    # Detect WSL environment
+    def is_wsl?
+      ENV['WSL_DISTRO_NAME'] != nil || 
+        (File.exist?('/proc/version') && File.read('/proc/version').include?('microsoft'))
+    end
+
+        # Get WSL network interface for VirtualBox
+    def wsl_vbox_interface
+      return nil unless is_wsl?
+      
+      # Try to find the interface connected to VirtualBox Host-Only network
+      interfaces = `ip -o link show`.split("\n")
+      
+      interfaces.each do |line|
+        if line.include?('eth1') || line.include?('vEthernet')
+          interface_name = line.split(':')[1].strip
+          return interface_name
         end
       end
-      false
-    rescue => e
-      puts "⚠️  Warning: Could not detect WSL mirrored mode: #{e.message}"
-      false
+      
+      'eth1' # Default fallback
+    rescue
+      'eth1'
     end
+
+    # Configure SSH access for WSL
+    def configure_ssh_access(node, ip_address)
+      return unless is_wsl?
+      
+      node.vm.provision "shell", run: "always", privileged: true, inline: <<-SHELL
+        set -e
+        
+        echo "🔧 Configuring SSH access for WSL..."
+        
+        # Ensure SSH server is installed and running
+        if ! command -v sshd &> /dev/null; then
+          apt-get update -qq
+          apt-get install -y openssh-server
+        fi
+        
+        # Configure SSH for better connectivity from WSL
+        mkdir -p /etc/ssh/sshd_config.d
+        
+        cat > /etc/ssh/sshd_config.d/99-wsl-access.conf <<'EOF'
+# WSL Access Configuration
+ListenAddress 0.0.0.0
+ListenAddress #{ip_address}
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication yes
+UseDNS no
+GSSAPIAuthentication no
+ClientAliveInterval 60
+ClientAliveCountMax 5
+TCPKeepAlive yes
+EOF
+        
+        # Restart SSH service
+        systemctl restart ssh || systemctl restart sshd || service ssh restart
+        
+        # Ensure SSH starts on boot
+        systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
+        
+        # Verify SSH is listening
+        if ss -tlnp | grep -q ':22'; then
+          echo "✅ SSH is listening on port 22"
+        else
+          echo "⚠️  Warning: SSH may not be listening properly"
+        fi
+        
+        # Add firewall rule if ufw is active
+        if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+          ufw allow 22/tcp
+          echo "✅ Firewall rule added for SSH"
+        fi
+        
+        echo "✅ SSH access configured for WSL"
+      SHELL
+    end
+
+    # Print WSL-specific warnings and information
+    def print_wsl_info
+      return unless is_wsl?
+      
+      puts "\n" + "="*80
+      puts "WSL ENVIRONMENT DETECTED"
+      puts "="*80
+      
+      if is_wsl_mirrored?
+        puts "⚠️  WSL Mirrored Networking Mode detected"
+        puts "   Special network configuration will be applied"
+      end
+      
+      puts "\n📋 WSL Network Information:"
+      puts "   Interface: #{wsl_vbox_interface}"
+      
+      # Check if fix script has been run
+      vbox_route = `ip route show | grep "#{shared_services_ip_prefix}"`.strip
+      
+      if vbox_route.empty?
+        puts "\n⚠️  WARNING: VirtualBox network route not configured!"
+        puts "   Run: bash scripts/fix-wsl-vbox-network.sh"
+      else
+        puts "   ✅ VirtualBox network route configured"
+      end
+      
+      puts "\n💡 Tips for WSL:"
+      puts "   • SSH connectivity may take longer to establish"
+      puts "   • Run 'bash scripts/test-wsl-ssh-connectivity.sh' to verify connections"
+      puts "   • Network routes are lost after WSL restart"
+      puts "="*80 + "\n"
+    end
+
+    # def is_wsl_mirrored?
+    #   if is_wsl?
+    #     # Try Windows user profile path first
+    #     windows_home = `cmd.exe /c "echo %USERPROFILE%" 2>/dev/null`.strip.gsub('\\', '/')
+        
+    #     # Convert Windows path to WSL path if needed
+    #     if windows_home && !windows_home.empty?
+    #       wsl_path = `/usr/bin/wslpath "#{windows_home}" 2>/dev/null`.strip
+    #       wslconfig_path = File.join(wsl_path, '.wslconfig') if wsl_path && !wsl_path.empty?
+    #     end
+        
+    #     # Fallback to direct path
+    #     wslconfig_path ||= '/mnt/c/Users/' + ENV['USER'] + '/.wslconfig'
+        
+    #     if File.exist?(wslconfig_path)
+    #       content = File.read(wslconfig_path)
+    #       # Check for mirrored mode in [wsl2] section
+    #       return content.match?(/\[wsl2\].*networkingMode\s*=\s*mirrored/m) ||
+    #              content.match?(/networkingMode\s*=\s*mirrored/)
+    #     end
+    #   end
+    #   false
+    # rescue => e
+    #   puts "⚠️  Warning: Could not detect WSL mirrored mode: #{e.message}"
+    #   false
+    # end
 
     def windows_host_ip
       if is_wsl?

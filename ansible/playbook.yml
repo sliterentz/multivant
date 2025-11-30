@@ -6,7 +6,7 @@
   tasks:
     - name: Set timezone
       timezone:
-        name: UTC
+        name: "{{ timezone | default('UTC') }}"
 
     - name: Update apt cache
       apt:
@@ -45,7 +45,7 @@
   roles:
     - role: identity-plane
       tags: ['identity', 'identity-plane']
-  when: enable_identity_plane | default(false) | bool
+      when: enable_identity_plane | default(false) | bool
 
 - name: Configure Build Plane
   hosts: build_plane
@@ -54,7 +54,7 @@
   roles:
     - role: build-plane
       tags: ['build', 'build-plane']
-  when: enable_build_plane | default(false) | bool
+      when: enable_build_plane | default(false) | bool
 
 - name: Configure Observability Plane
   hosts: observability_plane
@@ -63,4 +63,4 @@
   roles:
     - role: observability
       tags: ['observability', 'monitoring']
-  when: enable_observability | default(false) | bool
+      when: enable_observability | default(false) | bool
