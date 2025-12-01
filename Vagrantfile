@@ -1,157 +1,219 @@
 # -*- Multicluster Blue Green Deployment With Vagrant -*-
+# Production-Ready Configuration with Platform Lifecycle Planes
 
-# Meload environment variables dari .env file menggunakan dotenv yang di install vagrant plugin
-unless Vagrant.has_plugin?("dotenv")
-  abort "The 'dotenv' vagrant plugin is not installed. Please run: vagrant plugin install dotenv"
+# Load environment variables
+unless Vagrant.has_plugin?("vagrant-env")
+  abort "The 'vagrant-env' vagrant plugin is not installed. Please run: vagrant plugin install vagrant-env"
 end
-require 'dotenv'
-Dotenv.load
+require 'vagrant-env'
 
-# Konfigurasi Cluster
-# Ubah nilai di bawah ini sesuai kebutuhan Anda
-$num_worker_nodes = ENV.fetch('NUM_WORKER_NODES', 1).to_i # Jumlah worker node per cluster (blue/green)
-$vm_memory = ENV.fetch('VM_MEMORY', 2048).to_i    # Memori per VM dalam MB
-$vm_cpus = ENV.fetch('VM_CPUS', 2).to_i         # Jumlah CPU per VM
+# Load helper modules
+require_relative 'vagrant/config'
+require_relative 'vagrant/helpers'
+require_relative 'vagrant/provisioners'
 
-# Konfigurasi Jaringan
-$blue_ip_prefix = ENV.fetch('BLUE_IP_PREFIX', "192.168.50.")
-$green_ip_prefix = ENV.fetch('GREEN_IP_PREFIX', "192.168.51.")
-$host_port_prefix_blue = ENV.fetch('HOST_PORT_PREFIX_BLUE', "81")
-$host_port_prefix_green = ENV.fetch('HOST_PORT_PREFIX_GREEN', "82")
-
-# Security
-$k3s_token = ENV.fetch('K3S_TOKEN') do
-  abort "K3S_TOKEN is not set in your .env file. Please define it."
-end # Token untuk join worker node
+# ============================================================================
+# VAGRANT CONFIGURATION
+# ============================================================================
 
 Vagrant.configure("2") do |config|
-  # Gunakan box Ubuntu 22.04 LTS (Jammy Jellyfish)
-  config.vm.box = "ubuntu/jammy64"
+  # Base Configuration
+  VagrantConfig.configure_base(config)
+  VagrantConfig.print_configuration
   
-  # Sinkronisasi folder script ke semua node
-  config.vm.synced_folder "./scripts", "/vagrant_scripts", disabled: false
-
-  # Pengaturan default untuk provider VirtualBox
-  config.vm.provider "virtualbox" do |vb|
-    vb.memory = $vm_memory
-    vb.cpus = $vm_cpus
+  # Global SSH Configuration for all nodes
+  config.ssh.insert_key = true
+  config.ssh.forward_agent = true
+  config.ssh.keep_alive = true
+  config.ssh.connect_timeout = 300
+  config.ssh.shell = "bash -c 'BASH_ENV=/etc/profile exec bash'"
+  
+  # WSL-specific SSH configuration
+  if VagrantHelpers.running_in_wsl?
+    config.ssh.extra_args = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    # Add retry logic for SSH connection
+    config.vm.boot_timeout = 600
+    config.vm.graceful_halt_timeout = 60
   end
 
-  # Fungsi untuk provisioning K3s master
-  def provision_k3s_master(node, ip, cluster_name)
-    node.vm.provision "shell", inline: <<-SHELL
-      echo "Disabling swap..."
-      sudo swapoff -a
-      sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  # ============================================================================
+  # SHARED SERVICES (Platform Lifecycle Planes)
+  # ============================================================================
+  
+  # Identity Plane
+  if VagrantConfig.enable_identity_plane?
+    config.vm.define "identity-plane", primary: false do |node|
+      identity_ip = "#{VagrantConfig.shared_services_ip_prefix}10"
 
-      echo "Installing K3s master..."
-      export INSTALL_K3S_EXEC="server --node-ip=#{ip} --flannel-iface=enp0s8 --bind-address=#{ip} --advertise-address=#{ip} --tls-san #{ip}"
-      curl -sfL https://get.k3s.io | K3S_TOKEN="#{$k3s_token}" sh -
-      
-      echo "Waiting for K3s to be ready..."
-      sleep 15
+      VagrantHelpers.configure_shared_service_node(
+        node,
+        name: "identity-plane",
+        ip: "#{VagrantConfig.shared_services_ip_prefix}10",
+        memory: VagrantConfig.identity_plane_memory,
+        cpus: VagrantConfig.identity_plane_cpus,
+        ports: {
+          "Keycloak" => [8080, 8080],
+          "Vault" => [8200, 8200]
+        },
+        node_type: "identity-plane"
+      )
 
-      echo "Copying kubeconfig to shared location for #{cluster_name}..."
-      sudo mkdir -p /vagrant/shared/#{cluster_name}
-      sudo cp /etc/rancher/k3s/k3s.yaml /vagrant/shared/#{cluster_name}/kubeconfig
-      sudo chmod 644 /vagrant/shared/#{cluster_name}/kubeconfig
-      
-      echo "K3s master for #{cluster_name} installation complete. Kubeconfig is at ./shared/#{cluster_name}/kubeconfig"
-      echo "Run 'export KUBECONFIG=$(pwd)/shared/#{cluster_name}/kubeconfig' to use kubectl from your host."
-    SHELL
-  end
-
-  # Fungsi untuk provisioning K3s worker
-  def provision_k3s_worker(node, master_ip, worker_ip)
-    node.vm.provision "shell", inline: <<-SHELL
-      echo "Disabling swap..."
-      sudo swapoff -a
-      sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
-
-      echo "Waiting for K3s API server on master to be ready..."
-      until sudo nc -zv #{master_ip} 6443; do
-        echo "K3s API server on master not yet available. Retrying in 5 seconds..."
-        sleep 5
-      done
-      echo "K3s API server is ready."
-
-      echo "Installing K3s worker..."
-      curl -sfL https://get.k3s.io | \
-        K3S_URL="https://#{master_ip}:6443" \
-        K3S_TOKEN="#{$k3s_token}" \
-        INSTALL_K3S_EXEC="agent --node-ip=#{worker_ip} --flannel-iface=enp0s8" \
-        INSTALL_K3S_SKIP_TLS_VERIFY=true \
-        sh -
-    SHELL
-  end
-
-  # --- BLUE CLUSTER ---
-  # Master Node Blue
-  config.vm.define "blue-master" do |master|
-    master_ip = "#{$blue_ip_prefix}10"
-    master.vm.hostname = "blue-master"
-    master.vm.network "private_network", ip: master_ip
-    master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_blue}80", auto_correct: true
-    master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_blue}43", auto_correct: true
-    
-    provision_k3s_master(master, master_ip, "blue")
-
-    # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
-    master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-      master.vm.provision "shell", inline: <<-SHELL
-      echo "Waiting for node-token to be created..."
-      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
-        sleep 2
-      done
-      echo "Node token found. Copying to web server..."
-      sudo mkdir -p /var/www/html
-      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
-    SHELL
-  end
-
-  # Worker Nodes Blue
-  (1..$num_worker_nodes).each do |i|
-    config.vm.define "blue-node-#{i}" do |node|
-      worker_ip = "#{$blue_ip_prefix}#{10 + i}"
-      node.vm.hostname = "blue-node-#{i}"
-      node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$blue_ip_prefix}10", worker_ip)
+      # Wait for network to be ready before SSH config
+      VagrantHelpers.wait_for_network_interface(node, identity_ip)
+      VagrantConfig.configure_ssh_access(node, identity_ip)
     end
   end
 
-  # --- GREEN CLUSTER ---
-  # Master Node Green
-  config.vm.define "green-master" do |master|
-    master_ip = "#{$green_ip_prefix}10"
-    master.vm.hostname = "green-master"
-    master.vm.network "private_network", ip: master_ip
-    master.vm.network "forwarded_port", guest: 80, host: "#{$host_port_prefix_green}80", auto_correct: true
-    master.vm.network "forwarded_port", guest: 443, host: "#{$host_port_prefix_green}43", auto_correct: true
-    
-    provision_k3s_master(master, master_ip, "green")
-    
-    # Provisioning untuk mendapatkan token K3s
-    master.vm.provision "shell", inline: "sudo apt-get update && sudo apt-get install -y nginx", run: "once"
-    master.vm.provision "shell", inline: "sudo systemctl start nginx", run: "always"
-      master.vm.provision "shell", inline: <<-SHELL
-      echo "Waiting for node-token to be created..."
-      while [ ! -f /var/lib/rancher/k3s/server/node-token ]; do
-        sleep 2
-      done
-      echo "Node token found. Copying to web server..."
-      sudo mkdir -p /var/www/html
-      echo -n "#{$k3s_token}" | sudo tee /var/www/html/token > /dev/null
-    SHELL
+  # Build Plane
+  if VagrantConfig.enable_build_plane?
+    config.vm.define "build-plane", primary: false do |node|
+      build_ip = "#{VagrantConfig.shared_services_ip_prefix}20"
+
+      VagrantHelpers.configure_shared_service_node(
+        node,
+        name: "build-plane",
+        ip: "#{VagrantConfig.shared_services_ip_prefix}20",
+        memory: VagrantConfig.build_plane_memory,
+        cpus: VagrantConfig.build_plane_cpus,
+        ports: {
+          "Jenkins" => [8081, 8081],
+          "Harbor" => [5000, 5000],
+          "GitLab" => [8082, 8082],
+          "ArgoCD" => [8083, 8083]
+        },
+        node_type: "build-plane",
+        extra_vars: {
+          blue_master_ip: "#{VagrantConfig.blue_ip_prefix}10",
+          green_master_ip: "#{VagrantConfig.green_ip_prefix}10"
+        }
+      )
+
+      # Wait for network to be ready before SSH config
+      VagrantHelpers.wait_for_network_interface(node, build_ip)
+      VagrantConfig.configure_ssh_access(node, build_ip)
+    end
   end
 
-  # Worker Nodes Green
-  (1..$num_worker_nodes).each do |i|
-    config.vm.define "green-node-#{i}" do |node|
-      worker_ip = "#{$green_ip_prefix}#{10 + i}"
-      node.vm.hostname = "green-node-#{i}"
-      node.vm.network "private_network", ip: worker_ip
-      provision_k3s_worker(node, "#{$green_ip_prefix}10", worker_ip)
+  # Observability Plane
+  if VagrantConfig.enable_observability?
+    config.vm.define "observability-plane", primary: false do |node|
+      obs_ip = "#{VagrantConfig.shared_services_ip_prefix}30"
+      
+      VagrantHelpers.configure_shared_service_node(
+        node,
+        name: "observability-plane",
+        ip: obs_ip,
+        memory: VagrantConfig.observability_memory,
+        cpus: VagrantConfig.observability_cpus,
+        ports: {
+          "Prometheus" => [9090, 9090],
+          "Grafana" => [3000, 3000],
+          "Loki" => [3100, 3100],
+          "Jaeger" => [16686, 16686],
+          "AlertManager" => [9093, 9093]
+        },
+        node_type: "observability-plane",
+        extra_vars: {
+          blue_master_ip: "#{VagrantConfig.blue_ip_prefix}10",
+          green_master_ip: "#{VagrantConfig.green_ip_prefix}10"
+        }
+      )
+
+      # Wait for network to be ready before SSH config
+      VagrantHelpers.wait_for_network_interface(node, obs_ip)
+      VagrantConfig.configure_ssh_access(node, obs_ip)
+    end
+  end
+
+  # ============================================================================
+  # BLUE CLUSTER
+  # ============================================================================
+  
+  # Blue Master Node
+  config.vm.define "blue-master", primary: true do |node|
+    blue_mstr_ip = "#{VagrantConfig.blue_ip_prefix}10"
+    
+    VagrantHelpers.configure_k3s_master_node(
+      node,
+      cluster_name: "blue",
+      hostname: "blue-master",
+      ip: blue_mstr_ip,
+      memory: VagrantConfig.control_plane_memory,
+      cpus: VagrantConfig.control_plane_cpus,
+      port_prefix: VagrantConfig.host_port_prefix_blue
+    )
+
+    # Wait for network to be ready before SSH config
+    VagrantHelpers.wait_for_network_interface(node, blue_mstr_ip)
+    VagrantConfig.configure_ssh_access(node, blue_mstr_ip)
+  end
+
+  # Blue Worker Nodes
+  (1..VagrantConfig.num_worker_nodes).each do |i|
+    config.vm.define "blue-node-#{i}", autostart: true do |node|
+      blue_wkr_ip = "#{VagrantConfig.blue_ip_prefix}#{10 + i}"
+
+      VagrantHelpers.configure_k3s_worker_node(
+        node,
+        cluster_name: "blue",
+        hostname: "blue-node-#{i}",
+        worker_number: i,
+        ip: blue_wkr_ip,
+        master_ip: "#{VagrantConfig.blue_ip_prefix}10",
+        memory: VagrantConfig.data_plane_memory,
+        cpus: VagrantConfig.data_plane_cpus,
+        port_prefix: VagrantConfig.host_port_prefix_blue
+      )
+
+      # Wait for network to be ready before SSH config
+      VagrantHelpers.wait_for_network_interface(node, blue_wkr_ip)
+      VagrantConfig.configure_ssh_access(node, blue_wkr_ip)
+    end
+  end
+
+  # ============================================================================
+  # GREEN CLUSTER
+  # ============================================================================
+  
+  # Green Master Node
+  config.vm.define "green-master", primary: true do |node|
+    green_mstr_ip = "#{VagrantConfig.green_ip_prefix}10"
+
+    VagrantHelpers.configure_k3s_master_node(
+      node,
+      cluster_name: "green",
+      hostname: "green-master",
+      ip: green_mstr_ip,
+      memory: VagrantConfig.control_plane_memory,
+      cpus: VagrantConfig.control_plane_cpus,
+      port_prefix: VagrantConfig.host_port_prefix_green
+    )
+
+    # Wait for network to be ready before SSH config
+    VagrantHelpers.wait_for_network_interface(node, green_mstr_ip)
+    VagrantConfig.configure_ssh_access(node, green_mstr_ip)
+  end
+
+  # Green Worker Nodes
+  (1..VagrantConfig.num_worker_nodes).each do |i|
+    config.vm.define "green-node-#{i}", autostart: true do |node|
+      green_wkr_ip = "#{VagrantConfig.green_ip_prefix}#{10 + i}"
+
+      VagrantHelpers.configure_k3s_worker_node(
+        node,
+        cluster_name: "green",
+        hostname: "green-node-#{i}",
+        worker_number: i,
+        ip: green_wkr_ip,
+        master_ip: "#{VagrantConfig.green_ip_prefix}10",
+        memory: VagrantConfig.data_plane_memory,
+        cpus: VagrantConfig.data_plane_cpus,
+        port_prefix: VagrantConfig.host_port_prefix_green
+      )
+
+      # Wait for network to be ready before SSH config
+      VagrantHelpers.wait_for_network_interface(node, green_wkr_ip)
+      VagrantConfig.configure_ssh_access(node, green_wkr_ip)
     end
   end
 end

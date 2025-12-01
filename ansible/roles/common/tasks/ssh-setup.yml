@@ -1,0 +1,35 @@
+---
+- name: Ensure SSH directory exists
+  file:
+    path: /root/.ssh
+    state: directory
+    mode: '0700'
+    owner: root
+    group: root
+
+- name: Configure SSH daemon for better connectivity
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    state: present
+  loop:
+    - { regexp: '^#?UseDNS', line: 'UseDNS no' }
+    - { regexp: '^#?GSSAPIAuthentication', line: 'GSSAPIAuthentication no' }
+    - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin prohibit-password' }
+    - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+    - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+  notify: restart ssh
+
+- name: Ensure SSH service is enabled and started
+  systemd:
+    name: ssh
+    state: started
+    enabled: yes
+
+- name: Wait for SSH to be fully ready
+  wait_for:
+    port: 22
+    delay: 5
+    timeout: 60
+    state: started

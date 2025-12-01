@@ -1,0 +1,145 @@
+---
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - master_ip is defined
+      - master_ip != ""
+      - k3s_token is defined
+      - k3s_token != ""
+      - cluster_name is defined
+      - cluster_name != ""
+    fail_msg: "Required variables (master_ip, k3s_token, cluster_name) must be defined"
+    success_msg: "All required variables are defined"
+
+- name: Display master node configuration
+  ansible.builtin.debug:
+    msg:
+      - "Cluster: {{ cluster_name }}"
+      - "Master IP: {{ master_ip }}"
+      - "K3s Token: {{ k3s_token[:10] }}..." # Show only first 10 chars for security
+
+- name: Set K3s master node arguments
+  ansible.builtin.set_fact:
+    k3s_master_exec_args: >-
+      server
+      --node-ip={{ master_ip }}
+      --flannel-iface=enp0s8
+      --tls-san={{ master_ip }}
+      --bind-address={{ master_ip }}
+      --advertise-address={{ master_ip }}
+      --disable=servicelb
+      --write-kubeconfig-mode=644
+      --token={{ k3s_token }}
+
+- name: Display K3s master arguments
+  ansible.builtin.debug:
+    msg: "K3s master will start with: {{ k3s_master_exec_args | regex_replace(k3s_token, 'REDACTED') }}"
+
+- name: Check if K3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Display K3s installation status
+  ansible.builtin.debug:
+    msg: "{{ 'K3s already installed, will skip installation' if k3s_binary.stat.exists else 'K3s not installed, proceeding with installation' }}"
+
+- name: Download K3s installer script
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s-installer.sh
+    mode: '0755'
+    timeout: 60
+  retries: 3
+  delay: 5
+  when: not k3s_binary.stat.exists
+
+- name: Install K3s master node
+  ansible.builtin.command: sh /tmp/k3s-installer.sh
+  environment:
+    INSTALL_K3S_EXEC: "{{ k3s_master_exec_args }}"
+    INSTALL_K3S_SKIP_TLS_VERIFY: "true"
+  args:
+    creates: /usr/local/bin/k3s
+  register: k3s_install_result
+  changed_when: k3s_install_result.rc == 0
+  when: not k3s_binary.stat.exists
+
+- name: Display K3s installation output
+  ansible.builtin.debug:
+    var: k3s_install_result.stdout_lines
+  when:
+    - k3s_install_result is defined
+    - k3s_install_result.stdout is defined
+    - k3s_install_result.stdout != ""
+
+- name: Wait for K3s service to be active
+  ansible.builtin.systemd:
+    name: k3s
+    state: started
+    enabled: yes
+  register: k3s_service
+  retries: 5
+  delay: 10
+  until: k3s_service is succeeded
+
+- name: Wait for kubeconfig to be created
+  ansible.builtin.wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    timeout: 60
+    state: present
+
+- name: Verify K3s is running
+  ansible.builtin.systemd:
+    name: k3s
+  register: k3s_status
+
+- name: Display K3s status
+  ansible.builtin.debug:
+    msg: "✅ K3s master is {{ k3s_status.status.ActiveState }}"
+
+- name: Create shared directory for kubeconfig
+  ansible.builtin.file:
+    path: "/vagrant/shared/{{ cluster_name }}"
+    state: directory
+    mode: '0755'
+  when: k3s_token_raw.stdout is defined
+
+- name: Copy kubeconfig to shared location
+  ansible.builtin.copy:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+    remote_src: yes
+    owner: vagrant
+    group: vagrant
+    mode: '0644'
+  when: k3s_token_raw.stdout is defined
+
+- name: Replace localhost with master IP in kubeconfig
+  ansible.builtin.lineinfile:
+    path: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+    regexp: '    server: https://127.0.0.1:6443'
+    line: '    server: https://{{ master_ip }}:6443'
+  when: k3s_token_raw.stdout is defined
+
+- name: Fetch kubeconfig to local shared directory
+  ansible.builtin.fetch:
+    src: "/vagrant/shared/{{ cluster_name }}/kubeconfig"
+    dest: "shared/{{ cluster_name }}/kubeconfig"
+    flat: yes
+  when: k3s_token_raw.stdout is defined
+
+- name: Copy Traefik dashboard config
+  ansible.builtin.copy:
+    src: traefik-dashboard-config.yml
+    dest: /var/lib/rancher/k3s/server/manifests/traefik-dashboard-config.yml
+    owner: vagrant
+    group: vagrant
+    mode: '0644'
+  when: k3s_token_raw.stdout is defined
+
+- name: Set master_ip fact for other hosts
+  ansible.builtin.set_fact:
+    master_ip: "{{ master_ip }}"
+    cacheable: yes
+  when: k3s_token_raw.stdout is defined

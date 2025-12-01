@@ -1,0 +1,66 @@
+---
+- name: Configure All Nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Set timezone
+      timezone:
+        name: "{{ timezone | default('UTC') }}"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+- name: Configure K3s Cluster Nodes
+  hosts: k3s_cluster
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: common
+      tags: ['common']
+
+- name: Configure K3s Master Nodes
+  hosts: k3s_master
+  become: yes
+  gather_facts: yes
+  serial: 1
+  roles:
+    - role: k3s-master
+      tags: ['k3s', 'k3s-master', 'master']
+
+- name: Configure K3s Worker Nodes
+  hosts: k3s_worker
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: k3s-worker
+      tags: ['k3s', 'k3s-worker', 'worker']
+
+- name: Configure Identity Plane
+  hosts: identity_plane
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: identity-plane
+      tags: ['identity', 'identity-plane']
+      when: enable_identity_plane | default(false) | bool
+
+- name: Configure Build Plane
+  hosts: build_plane
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: build-plane
+      tags: ['build', 'build-plane']
+      when: enable_build_plane | default(false) | bool
+
+- name: Configure Observability Plane
+  hosts: observability_plane
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: observability
+      tags: ['observability', 'monitoring']
+      when: enable_observability | default(false) | bool
